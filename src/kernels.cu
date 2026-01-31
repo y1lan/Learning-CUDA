@@ -1,3 +1,6 @@
+#include <__clang_cuda_builtin_vars.h>
+#include <__clang_cuda_runtime_wrapper.h>
+#include <cassert>
 #include <cstdio>
 #include <cuda_fp16.h>
 #include <vector>
@@ -69,30 +72,30 @@ __global__ void trace_load(const T *data, T *diagnol, size_t steps,
  */
 template <typename T>
 T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
-  if(h_input.size() != rows * cols){
+  if (h_input.size() != rows * cols) {
     return T{};
   }
   size_t steps = std::min(rows, cols);
-  if (steps == 0){
+  if (steps == 0) {
     return T{};
   }
   const T *data = h_input.data();
   const unsigned block_size = 256;
   const dim3 blockdim = block_size;
-  const dim3 griddim = (steps + block_size - 1)/ block_size;
+  const dim3 griddim = (steps + block_size - 1) / block_size;
   T *input;
-  T* diagonal;
+  T *diagonal;
   T *output;
   cudaMalloc(&input, h_input.size() * sizeof(T));
   cudaMalloc(&diagonal, steps * sizeof(T));
   cudaMalloc(&output, griddim.x * sizeof(T));
   cudaMemcpy(input, h_input.data(), h_input.size() * sizeof(T),
              cudaMemcpyKind::cudaMemcpyHostToDevice);
-  
+
   trace_load<T><<<griddim, blockdim>>>(input, diagonal, steps, cols);
   trace_kernel<T><<<griddim, blockdim>>>(diagonal, output, steps);
   T sum{};
-  std::vector<T>host_output(griddim.x);
+  std::vector<T> host_output(griddim.x);
   cudaMemcpy(host_output.data(), output, griddim.x * sizeof(T),
              cudaMemcpyKind::cudaMemcpyDeviceToHost);
   cudaDeviceSynchronize();
@@ -109,8 +112,50 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
   }
   cudaFree(input);
   cudaFree(output);
-  cudaFree(diagonal); 
+  cudaFree(diagonal);
   return sum;
+}
+
+/**
+  threadIdx.x -> the id of q
+  threadIdx.y -> the id of k, v
+  blockIdx.x -> the id of qhead
+  blockIdx.y -> the id of batch
+  Q_BLOCK_SIZE == blockDim.x
+**/
+template <typename T, int Q_BLOCK_SIZE>
+__global__ void vector_flash(const T *q, const T *k, const T *v, T *o,
+                             int batch_size, int target_seq_len,
+                             int src_seq_len, int query_heads, int kv_heads,
+                             int head_dim, bool is_causal) {
+
+  __shared__ T l[Q_BLOCK_SIZE]; // used to recored each l of block devided q
+  __shared__ T f[Q_BLOCK_SIZE]; // used to recored each f of block devided q
+
+  int q_id = threadIdx.x;
+  int q_stride = (src_seq_len / blockDim.x) + 1;
+
+  int kv_id = threadIdx.y;
+  int kv_stride = (target_seq_len / blockDim.y) + 1;
+
+  assert(q_stride == kv_stride); // the q stride and the kv stride should be
+                                 // equal for matrix multiplication.
+
+  int qhead_id = blockIdx.x;
+  int qhead_stride = query_heads / gridDim.x;
+  int kvhead_id = qhead_id / (query_heads / kv_heads);
+  int batch_id = blockIdx.y;
+
+  int q_global_offset = batch_id * (target_seq_len * query_heads * head_dim) +
+                        q_id * (query_heads * head_dim) + qhead_id * head_dim;
+
+  int k_global_offset = batch_id * (src_seq_len * kv_heads * head_dim) +
+                        kv_id * (kv_heads * head_dim) + kvhead_id * head_dim;
+
+  for (int i = q_id; i < target_seq_len; i += q_stride){
+    
+  }
+    
 }
 
 /**
