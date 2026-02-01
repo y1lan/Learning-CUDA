@@ -146,16 +146,17 @@ __global__ void vector_flash(const T *q, const T *k, const T *v, T *o,
   int kvhead_id = qhead_id / (query_heads / kv_heads);
   int batch_id = blockIdx.y;
 
-  int q_global_offset = batch_id * (target_seq_len * query_heads * head_dim) +
-                        q_id * (query_heads * head_dim) + qhead_id * head_dim;
+  for (int q_index = q_id, kv_index = kv_id; q_index < target_seq_len;
+       q_index += q_stride, kv_index += kv_stride) {
+    int q_global_offset = batch_id * (target_seq_len * query_heads * head_dim) +
+                          q_index * (query_heads * head_dim) +
+                          qhead_id * head_dim;
 
-  int k_global_offset = batch_id * (src_seq_len * kv_heads * head_dim) +
-                        kv_id * (kv_heads * head_dim) + kvhead_id * head_dim;
-
-  for (int i = q_id; i < target_seq_len; i += q_stride){
+    int k_global_offset = batch_id * (src_seq_len * kv_heads * head_dim) +
+                          kv_index * (kv_heads * head_dim) +
+                          kvhead_id * head_dim;
     
   }
-    
 }
 
 /**
