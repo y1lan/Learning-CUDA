@@ -1,14 +1,15 @@
-#include <__clang_cuda_builtin_vars.h>
-#include <__clang_cuda_runtime_wrapper.h>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <vector>
 
 #include "../tester/utils.h"
 
 template <typename T>
-__global__ void trace_kernel(const T *diagonol, T *trace, size_t steps) {
+__global__ void trace_kernel(const T *diagonal, T *trace, size_t steps) {
   __shared__ T smem[32];
   // thread id in block
   size_t tid = threadIdx.x;
@@ -17,7 +18,7 @@ __global__ void trace_kernel(const T *diagonol, T *trace, size_t steps) {
   size_t stride = blockDim.x * gridDim.x;
   T thread_sum{};
   for (size_t i = gid; i < steps; i += stride) {
-    thread_sum += diagonol[i];
+    thread_sum += diagonal[i];
   }
   unsigned mask = __activemask();
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -116,46 +117,139 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
   return sum;
 }
 
+template <typename T> __device__ __forceinline__ T dev_max(T lhs, T rhs) {
+  return lhs > rhs ? lhs : rhs;
+}
+
+__device__ __forceinline__ half dev_max(half lhs, half rhs) {
+  return __hgt(lhs, rhs) ? lhs : rhs;
+}
+
 /**
   threadIdx.x -> the id of q
-  threadIdx.y -> the id of k, v
-  blockIdx.x -> the id of qhead
+  threadIdx.y -> the q_block_id of q
+  blockIdx.x -> the id of q_head
   blockIdx.y -> the id of batch
   Q_BLOCK_SIZE == blockDim.x
 **/
-template <typename T, int Q_BLOCK_SIZE>
-__global__ void vector_flash(const T *q, const T *k, const T *v, T *o,
-                             int batch_size, int target_seq_len,
-                             int src_seq_len, int query_heads, int kv_heads,
-                             int head_dim, bool is_causal) {
-
-  __shared__ T l[Q_BLOCK_SIZE]; // used to recored each l of block devided q
-  __shared__ T f[Q_BLOCK_SIZE]; // used to recored each f of block devided q
-
-  int q_id = threadIdx.x;
-  int q_stride = (src_seq_len / blockDim.x) + 1;
-
-  int kv_id = threadIdx.y;
-  int kv_stride = (target_seq_len / blockDim.y) + 1;
-
-  assert(q_stride == kv_stride); // the q stride and the kv stride should be
-                                 // equal for matrix multiplication.
-
-  int qhead_id = blockIdx.x;
-  int qhead_stride = query_heads / gridDim.x;
-  int kvhead_id = qhead_id / (query_heads / kv_heads);
+template <typename T, int KV_BLOCK_SIZE, int HEADDIM>
+__global__ void q_flash(const T *q, const T *k, const T *v, T *o,
+                        int batch_size, int target_seq_len, int src_seq_len,
+                        int query_heads, int kv_heads, int head_dim,
+                        bool is_causal) {
   int batch_id = blockIdx.y;
+  int qhead_id = blockIdx.x;
+  int kv_head_id = (qhead_id * kv_heads) / query_heads;
+  int q_id = threadIdx.y * blockDim.x + threadIdx.x;
+  if (q_id >= target_seq_len) {
+    return;
+  }
+  // there are many warps so that the kv cache can be filled in.
+  int warp = threadIdx.y;
+  int warp_stride = blockDim.y;
+  // blockDim.x == 32, so is warp size.
+  int lane = threadIdx.x;
+  // KV_BLOCK_SIZE should be the product of Q_BLOCK_SIZE;
+  __shared__ T k_cache[KV_BLOCK_SIZE][HEADDIM];
+  __shared__ T v_cache[KV_BLOCK_SIZE][HEADDIM];
 
-  for (int q_index = q_id, kv_index = kv_id; q_index < target_seq_len;
-       q_index += q_stride, kv_index += kv_stride) {
-    int q_global_offset = batch_id * (target_seq_len * query_heads * head_dim) +
-                          q_index * (query_heads * head_dim) +
-                          qhead_id * head_dim;
+  T s_ij[KV_BLOCK_SIZE] = {};
+  T o_cache[HEADDIM] = {};
+  T o_new[HEADDIM] = {};
+  T m{}, l{};
+  const T *q_offset = q + batch_id * (target_seq_len * query_heads * head_dim) +
+                      q_id * (query_heads * head_dim) + qhead_id * head_dim;
+  T *o_offset = o + batch_id * (target_seq_len * query_heads * head_dim) +
+                q_id * (query_heads * head_dim) + qhead_id * head_dim;
+  int kv_steps = 0;
+  for (int kv_block = 0; kv_block < src_seq_len; kv_block += KV_BLOCK_SIZE) {
+    // load just one block of kv data
+    if (is_causal && kv_steps > q_id) {
+      break;
+    }
+    for (int kv_cache_id = warp;
+         kv_cache_id < KV_BLOCK_SIZE && kv_cache_id + kv_block < src_seq_len;
+         kv_cache_id += warp_stride) {
+      for (int head_dim_id = lane; head_dim_id < head_dim;
+           head_dim_id += HEADDIM) {
+        if (head_dim_id < head_dim) {
+          k_cache[kv_cache_id][head_dim_id] =
+              *(k + batch_id * (src_seq_len * kv_heads * head_dim) +
+                (kv_block + kv_cache_id) * (kv_heads * head_dim) +
+                kv_head_id * (head_dim) + head_dim_id);
+          v_cache[kv_cache_id][head_dim_id] =
+              *(v + batch_id * (src_seq_len * kv_heads * head_dim) +
+                (kv_block + kv_cache_id) * (kv_heads * head_dim) +
+                kv_head_id * (head_dim) + head_dim_id);
+        }
+      }
+    }
+    // load all kv data into kv cache
+    __syncthreads();
 
-    int k_global_offset = batch_id * (src_seq_len * kv_heads * head_dim) +
-                          kv_index * (kv_heads * head_dim) +
-                          kvhead_id * head_dim;
-    
+    // S_ij = Q_i \times K_i^T \in R^{1 \times KV_BLOCK_SIZE}
+    int block_steps = (kv_steps + KV_BLOCK_SIZE > src_seq_len)
+                          ? src_seq_len - kv_steps
+                          : KV_BLOCK_SIZE;
+    for (int i = 0; i < block_steps; i++) {
+      int global_kv_id = kv_steps + i;
+      if (is_causal && global_kv_id > q_id) {
+        s_ij[i] = -INFINITY;
+      } else {
+        s_ij[i] = T{};
+#pragma unroll
+        for (int j = 0; j < head_dim; j++) {
+          s_ij[i] += (*(q_offset + j)) * (k_cache[i][j]);
+        }
+      }
+    }
+    // m_ij = rowmax(S_ij)
+    T m_ij = s_ij[0];
+#pragma unroll
+    for (int i = 0; i < block_steps; i++) {
+      m_ij = dev_max<T>(m_ij, s_ij[i]);
+    }
+
+    // P_ij = exp(S_ij - m_ij) \in R^{1 \times KV_BLOCK_SIZE}
+    // l_ij = rowsum(P_ij) \in R;
+    T l_ij = 0;
+#pragma unroll
+    for (int i = 0; i < block_steps; i++) {
+      s_ij[i] = __expf((float)(s_ij[i] - m_ij));
+      l_ij += s_ij[i];
+    }
+
+    T m_new = dev_max<T>(m, m_ij);
+    T l_new = (T)__expf((float)(m - m_new)) * l +
+              (T)__expf((float)(m_ij - m_new)) * l_ij;
+
+#pragma unroll
+    for (int i = 0; i < head_dim; i++) {
+      o_cache[i] = o_cache[i] * (T)(__expf((float)(m - m_new))) * (l) / l_new;
+    }
+
+    // e^{m_ij - m_new} \dot P_ij \times V_j;
+    for (int i = 0; i < head_dim; i++) {
+      o_new[i] = T{};
+      for (int j = 0; j < block_steps; j++) {
+        o_new[i] += (double)s_ij[j] * (double)v_cache[j][i];
+      }
+      o_new[i] = o_new[i] * (T)(__expf((float)(m_ij - m_new))) / l_new;
+    }
+
+#pragma unroll
+    for (int i = 0; i < head_dim; i++) {
+      o_cache[i] = o_cache[i] + o_new[i];
+    }
+    l = l_new;
+    m = m_new;
+    kv_steps += block_steps;
+
+    __syncthreads();
+  }
+
+  for (int i = 0; i < head_dim; i++) {
+    *(o_offset + i) = o_cache[i];
   }
 }
 
@@ -186,7 +280,54 @@ void flashAttention(const std::vector<T> &h_q, const std::vector<T> &h_k,
                     int batch_size, int target_seq_len, int src_seq_len,
                     int query_heads, int kv_heads, int head_dim,
                     bool is_causal) {
-  // TODO: Implement the flash attention function
+
+  T *d_q, *d_k, *d_v, *d_o;
+  cudaMalloc(&d_q, h_q.size() * sizeof(T));
+  cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(T),
+             cudaMemcpyKind::cudaMemcpyHostToDevice);
+
+  cudaMalloc(&d_k, h_k.size() * sizeof(T));
+  cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(T),
+             cudaMemcpyKind::cudaMemcpyHostToDevice);
+
+  cudaMalloc(&d_v, h_v.size() * sizeof(T));
+  cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(T),
+             cudaMemcpyKind::cudaMemcpyHostToDevice);
+  cudaMalloc(&d_o, h_o.size() * sizeof(T));
+  cudaMemcpy(d_o, h_o.data(), h_o.size() * sizeof(T),
+             cudaMemcpyKind::cudaMemcpyHostToDevice);
+  // cudaStream_t stream[32];
+  switch (head_dim) {
+  case 1:
+  case 2:
+  case 4:
+  case 8:
+  case 16:
+  case 32:
+    q_flash<T, 64, 32><<<dim3{(unsigned)query_heads, (unsigned)batch_size},
+                         dim3{32, ((unsigned)target_seq_len / 32) + 1}, 0, 0>>>(
+        d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal);
+    break;
+  case 64:
+    q_flash<T, 32, 64><<<dim3{(unsigned)query_heads, (unsigned)batch_size},
+                         dim3{32, ((unsigned)target_seq_len / 32) + 1}, 0, 0>>>(
+        d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal);
+    break;
+  }
+
+  // for (int i = 0; i < 32; i++) {
+  //   cudaStreamSynchronize(stream[i]);
+  // }
+  cudaDeviceSynchronize();
+  cudaMemcpy(h_o.data(), d_o, h_o.size() * sizeof(T),
+             cudaMemcpyKind::cudaMemcpyDeviceToHost);
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_o);
+  return;
 }
 
 // *********************************************************************
